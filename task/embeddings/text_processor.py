@@ -1,4 +1,6 @@
 from enum import StrEnum
+import re
+from tokenize import cookie_re
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -28,19 +30,75 @@ class TextProcessor:
             user=self.db_config['user'],
             password=self.db_config['password']
         )
+    
 
-    #TODO:
-    # provide method `process_text_file` that will:
-    #   - apply file name, chunk size, overlap, dimensions and bool of the table should be truncated
-    #   - truncate table with vectors if needed
-    #   - load content from file and generate chunks (in `utils.text` present `chunk_text` that will help do that)
-    #   - generate embeddings from chunks
-    #   - save (insert) embeddings and chunks to DB
-    #       hint 1: embeddings should be saved as string list
-    #       hint 2: embeddings string list should be casted to vector ({embeddings}::vector)
+    def process_text_file(self,file_name: str, chunk_size:int, overlap: int, dimensions: int, 
+                          truncate_table: bool = True):
+        """Processing text file and saving the embeddings"""
 
+        with open(file_name, "r", encoding='utf-8') as file:
+            bytes = file.read()
 
+        chunks = chunk_text(bytes, chunk_size=chunk_size, overlap=overlap)
+        embeddings = self.embeddings_client.get_embeddings(inputs=chunks, dimensions=dimensions)
 
+        if truncate_table:
+            self._truncate_table()
+
+        print(f"Processing document: {file_name}")
+        print(f"Total chunks: {len(chunks)}")
+        print(f"Total embeddings: {len(embeddings)}")
+
+        for i in range(len(chunks)):
+            self._save_chunk(file_name=file_name, chunk=chunks[i], embedding=embeddings[i])
+
+    def _truncate_table(self):
+        """Truncating the embeddings table"""
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE vectors")
+            conn.commit()
+        
+    def _save_chunk(self, file_name: str, chunk: str, embedding: list[str]):
+        """Save chunk with embedding to database"""
+        embedding_string = f"[{','.join(map(str, embedding))}]"
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO vectors(document_name,text,embedding) VALUES(%s, %s, %s::vector)", 
+                            (file_name, chunk, embedding_string))
+
+    def search(self, input: str, search_mode: SearchMode, top_k: float, score_threshold: float,
+               dimensions: int):
+        """Searching for relevant content"""
+        input_embeddings = self.embeddings_client.get_embeddings(
+            inputs=input, 
+            dimensions=dimensions
+        )[0]
+
+        if search_mode == SearchMode.COSINE_DISTANCE:
+            max_distance = 1.0 - score_threshold
+        else:
+            max_distance = float('inf') if score_threshold == 0 else (1.0 / score_threshold) - 1.0
+
+        vector_string = f"[{','.join(map(str, input_embeddings))}]"
+
+        found_context = []
+        with self._get_connection() as conn: 
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(self._get_search_query(search_mode), 
+                            (vector_string, vector_string, max_distance, top_k)) 
+                results = cur.fetchall()
+                for row in results:
+                    found_context.append(row['text'])
+
+        return found_context
+    
+    def _get_search_query(self, search_mode: SearchMode) -> str:
+        return """SELECT text, embedding {mode} %s::vector AS distance
+                FROM vectors 
+                WHERE embedding {mode} %s::vector <= %s
+                ORDER BY distance
+                LIMIT %s""".format(mode='<->' if search_mode == SearchMode.EUCLIDIAN_DISTANCE else '<=>')
 
     #TODO:
     # provide method `search` that will:
